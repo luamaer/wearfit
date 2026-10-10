@@ -1,6 +1,7 @@
 const PROXY_DOMAINS = [
-    "https://avatar.roproxy.com/v1/",
-    "https://avatar.ff-roproxy.com/v1/"
+    (path) => `https://avatar.roproxy.com/v1/${path}`,
+    (path) => `https://avatar.ff-roproxy.com/v1/${path}`,
+    (path) => `https://corsproxy.io/?url=${encodeURIComponent('https://avatar.roblox.com/v1/' + path)}`
 ];
 
 const USERS_API = "https://users.roproxy.com/v1/users/";
@@ -8,54 +9,49 @@ const USERNAME_LOOKUP_API = "https://users.roproxy.com/v1/usernames/users";
 const AVATAR_THUMBNAILS_API = "https://thumbnails.roproxy.com/v1/users/avatar?size=420x420&format=Png&isCircular=false&userIds=";
 const OUTFIT_THUMBNAILS_API = "https://thumbnails.roproxy.com/v1/users/outfits?size=150x150&format=Png&isCircular=false&userOutfitIds=";
 
-// Helper: fetch with retry and proxy fallback
-async function fetchWithProxyFallback(path, options = {}, retries = 2) {
+// Fetch with automatic proxy fallback and rate-limit handling
+async function fetchOutfitPage(userId, page) {
+    const path = `users/${userId}/outfits?page=${page}&itemsPerPage=50`;
     let lastError = null;
     let lastStatus = null;
 
-    for (const base of PROXY_DOMAINS) {
-        const url = base + path;
-        for (let attempt = 0; attempt <= retries; attempt++) {
-            try {
-                const res = await fetch(url, options);
+    for (const getUrl of PROXY_DOMAINS) {
+        try {
+            const url = getUrl(path);
+            const res = await fetch(url);
 
-                // If private inventory, don't retry—exit immediately
-                if (res.status === 403) {
-                    const err = new Error("Inventory or outfits are private.");
-                    err.status = 403;
-                    throw err;
-                }
-
-                // If rate limited (429), pause and retry or switch proxy
-                if (res.status === 429) {
-                    lastStatus = 429;
-                    if (attempt < retries) {
-                        await new Promise(r => setTimeout(r, 1200 * (attempt + 1)));
-                        continue;
-                    }
-                    break; // Switch to next proxy
-                }
-
-                if (!res.ok) {
-                    lastStatus = res.status;
-                    break; // Non-ok response, try next proxy
-                }
-
-                return await res.json();
-            } catch (err) {
-                if (err.status === 403) throw err;
-                lastError = err;
+            if (res.status === 403) {
+                const err = new Error("Inventory or outfits are private.");
+                err.status = 403;
+                throw err;
             }
+
+            if (res.status === 429) {
+                lastStatus = 429;
+                continue; // Try next proxy immediately
+            }
+
+            if (!res.ok) {
+                lastStatus = res.status;
+                continue;
+            }
+
+            const data = await res.json();
+            const list = Array.isArray(data) ? data : (data?.data || []);
+            return list;
+        } catch (err) {
+            if (err.status === 403) throw err;
+            lastError = err;
         }
     }
 
-    const error = new Error(
-        lastStatus === 429 
-            ? "Rate limit reached. Please wait a few seconds and try again." 
-            : (lastError ? lastError.message : "Failed to connect to outfit API.")
-    );
-    error.status = lastStatus;
-    throw error;
+    if (lastStatus === 429) {
+        const err = new Error("Roblox API rate limit reached. Please wait a moment.");
+        err.status = 429;
+        throw err;
+    }
+
+    throw lastError || new Error("Failed to reach outfits API.");
 }
 
 async function searchPlayer() {
@@ -73,7 +69,7 @@ async function searchPlayer() {
     try {
         let userId = input;
 
-        // If the user entered a username instead of a numeric ID, resolve it
+        // Automatically resolve usernames if the input isn't numbers
         if (!/^\d+$/.test(input)) {
             statusText.textContent = "Resolving username to User ID...";
             const lookupRes = await fetch(USERNAME_LOOKUP_API, {
@@ -131,28 +127,24 @@ async function fetchOutfits(userId) {
         let page = 1;
         let isFetching = true;
 
-        // 3. PAGINATION: Loop with small throttling delays to prevent 429
         while (isFetching) {
-            // Note: outfitType is filtered client-side, not via query param
-            const endpointPath = `users/${userId}/outfits?page=${page}&itemsPerPage=50&isEditable=true`;
-            const outfitsData = await fetchWithProxyFallback(endpointPath);
+            statusText.textContent = page === 1 
+                ? "Scanning for outfits..." 
+                : `Scanning page ${page} (${allOutfits.length} found)...`;
 
-            if (outfitsData && outfitsData.data && outfitsData.data.length > 0) {
-                // Filter client-side to ensure custom avatar outfits
-                const filtered = outfitsData.data.filter(outfit => 
-                    outfit.isEditable !== false && (!outfit.outfitType || outfit.outfitType === "Avatar")
-                );
+            const pageItems = await fetchOutfitPage(userId, page);
 
-                allOutfits = allOutfits.concat(filtered);
-                statusText.textContent = `Scanned ${allOutfits.length} custom outfits...`;
+            if (pageItems && pageItems.length > 0) {
+                allOutfits = allOutfits.concat(pageItems);
+                statusText.textContent = `Found ${allOutfits.length} outfits...`;
 
-                // If Roblox returned fewer than 50, we reached the last page
-                if (outfitsData.data.length < 50) {
+                // If fewer than 50 returned, we've reached the last page
+                if (pageItems.length < 50) {
                     isFetching = false;
                 } else {
                     page++;
-                    // 350ms delay between pages prevents tripping Roblox's per-IP rate limit
-                    await new Promise(r => setTimeout(r, 350));
+                    // 250ms breathing room between page requests to prevent rate limits
+                    await new Promise(r => setTimeout(r, 250));
                 }
             } else {
                 isFetching = false;
@@ -162,16 +154,16 @@ async function fetchOutfits(userId) {
         const outfits = allOutfits;
 
         if (!outfits || outfits.length === 0) {
-            statusText.textContent = "No custom outfits found for this player (or outfits are hidden).";
+            statusText.textContent = "No outfits found for this player (either they have no saved outfits, or their inventory/outfits are private).";
             return;
         }
 
-        statusText.textContent = `Found ${outfits.length} custom outfits. Fetching images...`;
+        statusText.textContent = `Found ${outfits.length} outfits. Fetching images...`;
 
         const thumbnailMap = {};
         const chunkSize = 50; 
 
-        // 4. CHUNKING: Fetch images in batches
+        // Batch fetch outfit thumbnails
         for (let i = 0; i < outfits.length; i += chunkSize) {
             const chunk = outfits.slice(i, i + chunkSize);
             const outfitIds = chunk.map(outfit => outfit.id).join(',');
@@ -195,7 +187,7 @@ async function fetchOutfits(userId) {
 
         statusText.textContent = `Successfully loaded all ${outfits.length} outfits.`;
 
-        // 5. Render cards
+        // Render outfit cards
         outfits.forEach(outfit => {
             const imageUrl = thumbnailMap[outfit.id];
             const outfitDiv = document.createElement('div');
@@ -224,7 +216,7 @@ async function fetchOutfits(userId) {
         if (error.status === 403) {
             statusText.textContent = "Failed to load outfits: This player's inventory/outfits are set to private.";
         } else if (error.status === 429) {
-            statusText.textContent = "Failed to load outfits: Roblox rate limit hit. Please wait a few seconds and try again.";
+            statusText.textContent = "Failed to load outfits: Rate limit reached. Please wait a few seconds and try again.";
         } else {
             statusText.textContent = `Failed to load outfits: ${error.message}`;
         }
@@ -245,7 +237,18 @@ async function fetchAccessories(outfitId, buttonElement) {
     buttonElement.textContent = "...";
 
     try {
-        const detailsData = await fetchWithProxyFallback(`outfits/${outfitId}/details`);
+        let detailsData = null;
+        for (const getUrl of PROXY_DOMAINS) {
+            try {
+                const res = await fetch(getUrl(`outfits/${outfitId}/details`));
+                if (res.ok) {
+                    detailsData = await res.json();
+                    break;
+                }
+            } catch (_) {}
+        }
+
+        if (!detailsData) throw new Error("Could not load details");
 
         let assetsHtml = "<ul>";
         if (detailsData.assets && detailsData.assets.length > 0) {
