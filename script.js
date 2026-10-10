@@ -1,8 +1,9 @@
-const USERS_API = "https://users.roproxy.com/v1/users/";
-const AVATAR_THUMBNAILS_API = "https://thumbnails.roproxy.com/v1/users/avatar?size=420x420&format=Png&isCircular=false&userIds=";
-const AVATAR_API = "https://avatar.roproxy.com/v1/";
-const OUTFIT_THUMBNAILS_API = "https://thumbnails.roproxy.com/v1/users/outfits?size=150x150&format=Png&isCircular=false&userOutfitIds=";
+const PROXY = "https://rbx-proxy.YOUR-SUB.workers.dev";
 
+const USERS_API = `${PROXY}/users/v1/users/`;
+const AVATAR_THUMBNAILS_API = `${PROXY}/thumbnails/v1/users/avatar?size=420x420&format=Png&isCircular=false&userIds=`;
+const AVATAR_API = `${PROXY}/avatar/v1/`;
+const OUTFIT_THUMBNAILS_API = `${PROXY}/thumbnails/v1/users/outfits?size=150x150&format=Png&isCircular=false&userOutfitIds=`;
 // --- rate-limit armor: global spacing + retry with backoff ---
 let __rlChain = Promise.resolve();
 function rlGate(ms = 250) {
