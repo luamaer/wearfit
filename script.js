@@ -3,6 +3,46 @@ const AVATAR_THUMBNAILS_API = "https://thumbnails.roproxy.com/v1/users/avatar?si
 const AVATAR_API = "https://avatar.roproxy.com/v1/";
 const OUTFIT_THUMBNAILS_API = "https://thumbnails.roproxy.com/v1/users/outfits?size=150x150&format=Png&isCircular=false&userOutfitIds=";
 
+// --- rate-limit armor: global spacing + retry with backoff ---
+let __rlChain = Promise.resolve();
+function rlGate(ms = 250) {
+    const slot = __rlChain.then(() => new Promise(r => setTimeout(r, ms)));
+    __rlChain = slot;
+    return slot;
+}
+
+async function robloxFetch(url, retries = 5) {
+    let lastErr = new Error("fetch failed");
+    for (let attempt = 1; attempt <= retries; attempt++) {
+        await rlGate();
+        let res;
+        try {
+            res = await fetch(url);
+        } catch (e) { lastErr = e; continue; }
+        if (res.ok) return res;
+        if (res.status !== 429 && res.status < 500) throw new Error(`HTTP ${res.status}`);
+        lastErr = new Error(`HTTP ${res.status}`);
+        await new Promise(r => setTimeout(r, Math.min(750 * 2 ** (attempt - 1), 6000) + Math.random() * 300));
+    }
+    throw lastErr;
+}
+
+async function fetchOutfitThumbnails(ids) {
+    const map = {};
+    let pending = ids.slice();
+    for (let round = 0; round < 4 && pending.length > 0; round++) {
+        if (round > 0) await new Promise(r => setTimeout(r, 1500));
+        const res = await robloxFetch(OUTFIT_THUMBNAILS_API + pending.join(","));
+        const data = (await res.json()).data || [];
+        pending = [];
+        for (const th of data) {
+            if (th.state === "Completed" && th.imageUrl) map[th.targetId] = th.imageUrl;
+            else if (th.state === "Pending") pending.push(th.targetId);
+        }
+    }
+    return map;
+}
+
 async function searchPlayer() {
     const userId = document.getElementById('userIdInput').value.trim();
     const statusText = document.getElementById('statusText');
@@ -16,17 +56,13 @@ async function searchPlayer() {
     outfitsContainer.innerHTML = "";
 
     try {
-        // 1. Fetch User Info
-        const userRes = await fetch(USERS_API + userId);
-        if (!userRes.ok) throw new Error("Player not found.");
+        const userRes = await robloxFetch(USERS_API + userId);
         const userData = await userRes.json();
 
-        // 2. Fetch User Avatar Image
-        const thumbRes = await fetch(AVATAR_THUMBNAILS_API + userId);
+        const thumbRes = await robloxFetch(AVATAR_THUMBNAILS_API + userId);
         const thumbData = await thumbRes.json();
         const avatarImageUrl = thumbData.data[0]?.imageUrl || "";
 
-        // Render Profile Card
         profileContainer.innerHTML = `
             <div class="profile-card">
                 <h2>${userData.displayName}</h2>
@@ -46,68 +82,44 @@ async function searchPlayer() {
 async function fetchOutfits(userId) {
     const statusText = document.getElementById('statusText');
     const outfitsContainer = document.getElementById('outfitsContainer');
-    
+
     statusText.textContent = "Scanning for all outfits... (this might take a moment)";
     outfitsContainer.innerHTML = "";
 
     try {
+        const PER_PAGE = 50;
         let allOutfits = [];
         let page = 1;
-        let isFetching = true;
 
-        // 3. PAGINATION: Loop through every page to bypass the default 25 limit
-        while (isFetching) {
-            // isEditable=true & outfitType=Avatar ensures we ONLY get custom outfits, no bundles or heads
-            // itemsPerPage=50 grabs the maximum allowed per request to speed up the loop
-            const endpoint = AVATAR_API + `users/${userId}/outfits?page=${page}&itemsPerPage=50&isEditable=true&outfitType=Avatar`;
-            const outfitsRes = await fetch(endpoint);
-            
-            if (!outfitsRes.ok) throw new Error("API failed to load outfits.");
-            const outfitsData = await outfitsRes.json();
+        while (true) {
+            // NOTE: no isEditable/outfitType params — they aren't valid on this endpoint
+            const endpoint = `${AVATAR_API}users/${userId}/outfits?page=${page}&itemsPerPage=${PER_PAGE}`;
+            const res = await robloxFetch(endpoint);
+            const data = (await res.json()).data || [];
 
-            if (outfitsData.data && outfitsData.data.length > 0) {
-                allOutfits = allOutfits.concat(outfitsData.data);
-                statusText.textContent = `Scanned ${allOutfits.length} custom outfits...`;
-
-                // If Roblox returns fewer than 50 outfits, we know we've reached the final page
-                if (outfitsData.data.length < 50) {
-                    isFetching = false;
-                } else {
-                    page++; // Go to the next page
-                }
-            } else {
-                isFetching = false; // No data returned
-            }
+            if (data.length === 0) break;
+            allOutfits = allOutfits.concat(data);
+            statusText.textContent = `Scanned ${allOutfits.length} outfits...`;
+            if (data.length < PER_PAGE) break;
+            page++;
         }
 
-        const outfits = allOutfits;
+        // filter client-side instead
+        const outfits = allOutfits.filter(o => o.isEditable);
 
-        if (!outfits || outfits.length === 0) {
-            statusText.textContent = "No saved outfits found, or their inventory is private.";
+        if (outfits.length === 0) {
+            statusText.textContent = "No saved outfits found.";
             return;
         }
 
-        statusText.textContent = `Found a total of ${outfits.length} custom outfits. Fetching images...`;
+        statusText.textContent = `Found ${outfits.length} custom outfits. Fetching images...`;
 
         const thumbnailMap = {};
-        const chunkSize = 50; 
-
-        // 4. CHUNKING: Fetch the 2D images in batches of 50 to avoid URL length limits
+        const chunkSize = 50;
         for (let i = 0; i < outfits.length; i += chunkSize) {
             const chunk = outfits.slice(i, i + chunkSize);
-            const outfitIds = chunk.map(outfit => outfit.id).join(',');
-            
             try {
-                const thumbnailsRes = await fetch(OUTFIT_THUMBNAILS_API + outfitIds);
-                const thumbnailsData = await thumbnailsRes.json();
-
-                if (thumbnailsData.data) {
-                    thumbnailsData.data.forEach(thumb => {
-                        if (thumb.state === "Completed") {
-                            thumbnailMap[thumb.targetId] = thumb.imageUrl;
-                        }
-                    });
-                }
+                Object.assign(thumbnailMap, await fetchOutfitThumbnails(chunk.map(o => o.id)));
             } catch (err) {
                 console.warn("A batch of images failed to load.", err);
             }
@@ -115,12 +127,11 @@ async function fetchOutfits(userId) {
 
         statusText.textContent = `Successfully loaded all ${outfits.length} outfits.`;
 
-        // 5. Render every single outfit
         outfits.forEach(outfit => {
             const imageUrl = thumbnailMap[outfit.id];
             const outfitDiv = document.createElement('div');
             outfitDiv.className = 'outfit-card';
-            
+
             let imageHtml = `<p style="color:#666; font-size:12px;">Image Pending</p>`;
             if (imageUrl) {
                 imageHtml = `<img class="outfit-thumbnail" src="${imageUrl}" alt="Outfit Image">`;
@@ -129,26 +140,24 @@ async function fetchOutfits(userId) {
             outfitDiv.innerHTML = `
                 <h3 title="${outfit.name}">${outfit.name}</h3>
                 ${imageHtml}
-                
                 <div class="action-buttons">
                     <button onclick="fetchAccessories('${outfit.id}', this)">Accessories</button>
                     <button class="copy-btn" onclick="copyAvatarScript('${outfit.id}', this)">Use Avatar</button>
                 </div>
-
                 <div id="acc-${outfit.id}" class="accessories-list"></div>
             `;
             outfitsContainer.appendChild(outfitDiv);
         });
 
     } catch (error) {
-        statusText.textContent = "Failed to load outfits. Rate limit hit or inventory private.";
+        statusText.textContent = "Failed to load outfits — " + error.message;
         console.error(error);
     }
 }
 
 async function fetchAccessories(outfitId, buttonElement) {
     const accContainer = document.getElementById(`acc-${outfitId}`);
-    
+
     if (accContainer.innerHTML !== "") {
         const isHidden = accContainer.style.display === "none";
         accContainer.style.display = isHidden ? "block" : "none";
@@ -159,7 +168,8 @@ async function fetchAccessories(outfitId, buttonElement) {
     buttonElement.textContent = "...";
 
     try {
-        const detailsRes = await fetch(AVATAR_API + `outfits/${outfitId}/details`);
+        // this endpoint is the most aggressive rate limit of the bunch — extra retries
+        const detailsRes = await robloxFetch(AVATAR_API + `outfits/${outfitId}/details`, 8);
         const detailsData = await detailsRes.json();
 
         let assetsHtml = "<ul>";
@@ -177,7 +187,7 @@ async function fetchAccessories(outfitId, buttonElement) {
         buttonElement.textContent = originalText;
 
     } catch (error) {
-        buttonElement.textContent = "Error";
+        buttonElement.textContent = "Retry"; // let them click again instead of dead "Error"
     }
 }
 
