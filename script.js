@@ -10,7 +10,6 @@ const PROXY_LIST = [
     (path) => `https://corsproxy.io/?url=${encodeURIComponent('https://avatar.roblox.com/' + path)}`
 ];
 
-// Helper: Query across proxy fallbacks
 async function fetchWithFallbacks(path) {
     let lastStatus = null;
     let lastError = null;
@@ -25,15 +24,14 @@ async function fetchWithFallbacks(path) {
             }
             if (res.status === 429) {
                 lastStatus = 429;
-                continue; // Rotate proxy on rate-limit
+                continue;
             }
             if (!res.ok) {
                 lastStatus = res.status;
                 continue;
             }
 
-            const data = await res.json();
-            return data;
+            return await res.json();
         } catch (err) {
             if (err.status === 403) throw err;
             lastError = err;
@@ -45,7 +43,7 @@ async function fetchWithFallbacks(path) {
         err.status = 429;
         throw err;
     }
-    throw lastError || new Error("Failed to reach Roblox proxy.");
+    throw lastError || new Error("Failed to reach Roblox API.");
 }
 
 async function searchPlayer() {
@@ -63,7 +61,6 @@ async function searchPlayer() {
     try {
         let userId = input;
 
-        // Auto-resolve usernames if the user entered a name instead of ID
         if (!/^\d+$/.test(input)) {
             statusText.textContent = "Resolving username to User ID...";
             const lookupRes = await fetch(USERNAME_LOOKUP_API, {
@@ -79,12 +76,10 @@ async function searchPlayer() {
             userId = lookupData.data[0].id;
         }
 
-        // 1. Fetch User Info
         const userRes = await fetch(USERS_API + userId);
         if (!userRes.ok) throw new Error("Player not found.");
         const userData = await userRes.json();
 
-        // 2. Fetch User Avatar Image
         let avatarImageUrl = "";
         try {
             const thumbRes = await fetch(AVATAR_THUMBNAILS_API + userId);
@@ -92,7 +87,6 @@ async function searchPlayer() {
             avatarImageUrl = thumbData.data?.[0]?.imageUrl || "";
         } catch (_) {}
 
-        // Render Profile Card
         profileContainer.innerHTML = `
             <div class="profile-card">
                 <h2>${userData.displayName}</h2>
@@ -109,43 +103,44 @@ async function searchPlayer() {
     }
 }
 
+// Stores raw outfits in memory for tab filtering
+let loadedOutfitsRaw = [];
+
 async function fetchOutfits(userId) {
     const statusText = document.getElementById('statusText');
     const outfitsContainer = document.getElementById('outfitsContainer');
     
-    statusText.textContent = "Checking inventory privacy & scanning outfits...";
+    statusText.textContent = "Checking inventory & fetching outfits...";
     outfitsContainer.innerHTML = "";
+    loadedOutfitsRaw = [];
 
     try {
-        // 1. Verify if the inventory is public
+        // 1. Check if inventory is private
         try {
             const privCheck = await fetch(`${INVENTORY_CHECK_API}${userId}/can-view-inventory`);
             if (privCheck.ok) {
                 const privData = await privCheck.json();
                 if (privData.canView === false) {
-                    statusText.innerHTML = `<span style="color: #ffaa00;">⚠️ This player's inventory is set to <b>Private</b>.<br>Roblox now requires <i>"Who can see my inventory?"</i> to be set to <b>"Everyone"</b> in Roblox Privacy Settings to view outfits.</span>`;
+                    statusText.innerHTML = `<span style="color: #ffaa00;">⚠️ This player's inventory is <b>Private</b>.<br>Roblox requires <i>"Who can see my inventory?"</i> to be set to <b>"Everyone"</b> to view saved outfits.</span>`;
                     return;
                 }
             }
         } catch (_) {}
 
-        let allOutfits = [];
+        let allItems = [];
         let page = 1;
         let isFetching = true;
 
-        // 2. PAGINATION LOOP (with v1 -> v2 fallback)
         while (isFetching) {
             statusText.textContent = `Scanning outfits (page ${page})...`;
             
             let data = null;
-            // Try v1 first
             try {
                 data = await fetchWithFallbacks(`v1/users/${userId}/outfits?page=${page}&itemsPerPage=50`);
             } catch (err) {
                 if (err.status === 403) throw err;
             }
 
-            // Fallback to v2 if v1 returns empty or fails on page 1
             if ((!data || !data.data || data.data.length === 0) && page === 1) {
                 try {
                     data = await fetchWithFallbacks(`v2/avatar/users/${userId}/outfits?page=1&itemsPerPage=50`);
@@ -155,91 +150,115 @@ async function fetchOutfits(userId) {
             const items = Array.isArray(data) ? data : (data?.data || []);
 
             if (items.length > 0) {
-                allOutfits = allOutfits.concat(items);
-                statusText.textContent = `Found ${allOutfits.length} outfits...`;
-
+                allItems = allItems.concat(items);
                 if (items.length < 50) {
                     isFetching = false;
                 } else {
                     page++;
-                    await new Promise(r => setTimeout(r, 250)); // Throttling delay
+                    await new Promise(r => setTimeout(r, 250));
                 }
             } else {
                 isFetching = false;
             }
         }
 
-        const outfits = allOutfits;
+        loadedOutfitsRaw = allItems;
 
-        if (!outfits || outfits.length === 0) {
-            statusText.innerHTML = `<span style="color: #ffaa00;">No outfits returned by Roblox.<br>If this user has saved outfits, their Roblox account privacy setting <b>"Who can see my inventory?"</b> is set to Private/Friends. Setting it to <b>"Everyone"</b> on Roblox will allow them to show up.</span>`;
+        if (loadedOutfitsRaw.length === 0) {
+            statusText.innerHTML = `<span style="color: #ffaa00;">No outfits returned by Roblox.<br>Make sure the player's Roblox inventory privacy is set to <b>Everyone</b>.</span>`;
             return;
         }
 
-        statusText.textContent = `Found ${outfits.length} outfits. Fetching images...`;
+        // Separate custom outfits from default dynamic heads / bundles
+        const customOutfits = loadedOutfitsRaw.filter(item => 
+            item.isEditable === true && item.outfitType !== "DynamicHead"
+        );
+        const starterBundles = loadedOutfitsRaw.filter(item => 
+            item.isEditable === false || item.outfitType === "DynamicHead"
+        );
 
-        const thumbnailMap = {};
-        const chunkSize = 50; 
-
-        // 3. Batch thumbnail fetching
-        for (let i = 0; i < outfits.length; i += chunkSize) {
-            const chunk = outfits.slice(i, i + chunkSize);
-            const outfitIds = chunk.map(outfit => outfit.id).join(',');
-            
-            try {
-                const thumbnailsRes = await fetch(OUTFIT_THUMBNAILS_API + outfitIds);
-                if (thumbnailsRes.ok) {
-                    const thumbnailsData = await thumbnailsRes.json();
-                    if (thumbnailsData.data) {
-                        thumbnailsData.data.forEach(thumb => {
-                            if (thumb.state === "Completed") {
-                                thumbnailMap[thumb.targetId] = thumb.imageUrl;
-                            }
-                        });
-                    }
-                }
-            } catch (err) {
-                console.warn("A batch of images failed to load.", err);
-            }
-        }
-
-        statusText.textContent = `Successfully loaded ${outfits.length} outfits.`;
-
-        // 4. Render outfit cards
-        outfits.forEach(outfit => {
-            const imageUrl = thumbnailMap[outfit.id];
-            const outfitDiv = document.createElement('div');
-            outfitDiv.className = 'outfit-card';
-            
-            let imageHtml = `<p style="color:#666; font-size:12px;">Image Pending</p>`;
-            if (imageUrl) {
-                imageHtml = `<img class="outfit-thumbnail" src="${imageUrl}" alt="Outfit Image">`;
-            }
-
-            outfitDiv.innerHTML = `
-                <h3 title="${outfit.name}">${outfit.name}</h3>
-                ${imageHtml}
-                
-                <div class="action-buttons">
-                    <button onclick="fetchAccessories('${outfit.id}', this)">Accessories</button>
-                    <button class="copy-btn" onclick="copyAvatarScript('${outfit.id}', this)">Use Avatar</button>
+        if (customOutfits.length > 0) {
+            statusText.textContent = `Found ${customOutfits.length} custom outfits (${starterBundles.length} default heads/bundles hidden).`;
+            await renderOutfitList(customOutfits);
+        } else {
+            statusText.innerHTML = `
+                <div style="color: #ccc; margin-bottom: 12px;">
+                    This player has <b>0 custom saved outfits</b>.<br>
+                    <span style="font-size: 13px; color: #888;">(Roblox returned ${starterBundles.length} default starter packages/dynamic heads).</span>
                 </div>
-
-                <div id="acc-${outfit.id}" class="accessories-list"></div>
+                <button onclick="renderOutfitList(loadedOutfitsRaw)">Show All ${starterBundles.length} Default Bundles/Heads</button>
             `;
-            outfitsContainer.appendChild(outfitDiv);
-        });
+        }
 
     } catch (error) {
         if (error.status === 403) {
-            statusText.textContent = "Failed to load outfits: This player's inventory/outfits are set to private.";
+            statusText.textContent = "Failed: This player's inventory/outfits are set to private.";
         } else if (error.status === 429) {
-            statusText.textContent = "Failed to load outfits: Rate limit reached. Please wait a few seconds and try again.";
+            statusText.textContent = "Failed: Roblox rate limit reached. Please wait a few seconds and try again.";
         } else {
-            statusText.textContent = `Failed to load outfits: ${error.message}`;
+            statusText.textContent = `Failed: ${error.message}`;
         }
         console.error(error);
     }
+}
+
+async function renderOutfitList(outfits) {
+    const statusText = document.getElementById('statusText');
+    const outfitsContainer = document.getElementById('outfitsContainer');
+    outfitsContainer.innerHTML = "";
+
+    const thumbnailMap = {};
+    const chunkSize = 50; 
+
+    // Batch fetch thumbnails
+    for (let i = 0; i < outfits.length; i += chunkSize) {
+        const chunk = outfits.slice(i, i + chunkSize);
+        const outfitIds = chunk.map(outfit => outfit.id).join(',');
+        
+        try {
+            const thumbnailsRes = await fetch(OUTFIT_THUMBNAILS_API + outfitIds);
+            if (thumbnailsRes.ok) {
+                const thumbnailsData = await thumbnailsRes.json();
+                if (thumbnailsData.data) {
+                    thumbnailsData.data.forEach(thumb => {
+                        if (thumb.state === "Completed") {
+                            thumbnailMap[thumb.targetId] = thumb.imageUrl;
+                        }
+                    });
+                }
+            }
+        } catch (err) {
+            console.warn("Failed loading batch images:", err);
+        }
+    }
+
+    // Render cards
+    outfits.forEach(outfit => {
+        const imageUrl = thumbnailMap[outfit.id];
+        const outfitDiv = document.createElement('div');
+        outfitDiv.className = 'outfit-card';
+        
+        let imageHtml = `<p style="color:#666; font-size:12px;">Image Pending</p>`;
+        if (imageUrl) {
+            imageHtml = `<img class="outfit-thumbnail" src="${imageUrl}" alt="Outfit Image">`;
+        }
+
+        const tag = outfit.isEditable === false ? `<span style="font-size: 11px; color: #888;">[Bundle/Head]</span><br>` : '';
+
+        outfitDiv.innerHTML = `
+            <h3 title="${outfit.name}">${outfit.name}</h3>
+            ${tag}
+            ${imageHtml}
+            
+            <div class="action-buttons">
+                <button onclick="fetchAccessories('${outfit.id}', this)">Accessories</button>
+                <button class="copy-btn" onclick="copyAvatarScript('${outfit.id}', this)">Use Avatar</button>
+            </div>
+
+            <div id="acc-${outfit.id}" class="accessories-list"></div>
+        `;
+        outfitsContainer.appendChild(outfitDiv);
+    });
 }
 
 async function fetchAccessories(outfitId, buttonElement) {
